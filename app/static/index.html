@@ -87,6 +87,11 @@
         <button class="secondary" id="send-root">① 先报入口</button>
         <button class="secondary" id="send-downstream">② 稍后补报下游</button>
       </div>
+      <label>批量链数（clean 链，到期后制造清理积压）</label>
+      <input type="number" id="batch_count" value="400" min="1" max="2000">
+      <div class="buttons">
+        <button class="secondary" id="send-batch">批量上报制造积压</button>
+      </div>
       <div id="log"></div>
     </section>
 
@@ -134,15 +139,19 @@ async function loadConfig() {
   const cfg = await (await fetch("/api/config")).json();
   state.config = cfg;
   $("cfg").textContent =
-    `窗口 ${cfg.window_seconds}s · 并发上限 ${cfg.max_active_traces} 条 · 慢根阈值 ${cfg.slow_root_ms}ms`;
+    `窗口 ${cfg.window_seconds}s · 并发上限 ${cfg.max_active_traces} 条 · 慢根阈值 ${cfg.slow_root_ms}ms · 清理 ${cfg.cleanup_batch_size}条/批`;
 }
 
 async function refresh() {
   const params = new URLSearchParams({ limit: "100" });
   if (state.filter) params.set("state", state.filter);
   const data = await (await fetch("/api/traces?" + params)).json();
+  const pending = data.pending_delete_spans, pendingMax = data.max_pending_delete_spans;
+  const backlogHot = pending >= pendingMax;
   $("caps").innerHTML =
-    `收集中的链 <b>${data.counts.collecting}/${data.capacity}</b> · 留存 <b>${data.counts.kept}</b> · 丢弃 <b>${data.counts.dropped}</b>`;
+    `收集中的链 <b>${data.counts.collecting}/${data.capacity}</b> · 留存 <b>${data.counts.kept}</b> · 丢弃 <b>${data.counts.dropped}</b>` +
+    ` · 待清理 <b${backlogHot ? ' style="color:#ff8f9b"' : ""}>${pending}</b>/${pendingMax}` +
+    (backlogHot ? ' · <span class="badge dropped">积压已满：暂拒新链</span>' : "");
   const tbody = $("trace-rows");
   tbody.innerHTML = "";
   for (const t of data.traces) {
@@ -192,7 +201,16 @@ function renderDetail(t) {
   if (t.state !== "collecting" && !reasons.length) reasons.push('<span class="badge ok">无异常</span>');
 
   const spans = t.spans || [];
-  const wf = spans.length ? renderWaterfall(spans) : '<div class="empty">窗口内没有留存的 span</div>';
+  const wf = spans.length
+    ? renderWaterfall(spans)
+    : t.state === "dropped"
+      ? '<div class="empty">已判定丢弃：原始 span 不再提供，残留数据由后台分批清理</div>'
+      : '<div class="empty">窗口内没有留存的 span</div>';
+  const rawJson = t.state === "dropped"
+    ? ""
+    : `<details><summary>原始 span JSON（${spans.length}）</summary>
+      <pre>${esc(JSON.stringify(spans.map((s) => ({ span_id: s.span_id, parent_span_id: s.parent_span_id, name: s.name, service: s.service, status: s.is_error ? "ERROR" : "OK", duration_ms: s.duration_ms, body: JSON.parse(s.body) })), null, 2))}</pre>
+    </details>`;
 
   $("detail").className = "";
   $("detail").innerHTML = `
@@ -206,9 +224,7 @@ function renderDetail(t) {
       <span>入口服务</span><span>${esc(t.service || "—")}</span>
     </div>
     <div class="waterfall">${wf}</div>
-    <details><summary>原始 span JSON（${spans.length}）</summary>
-      <pre>${esc(JSON.stringify(spans.map((s) => ({ span_id: s.span_id, parent_span_id: s.parent_span_id, name: s.name, service: s.service, status: s.is_error ? "ERROR" : "OK", duration_ms: s.duration_ms, body: JSON.parse(s.body) })), null, 2))}</pre>
-    </details>`;
+    ${rawJson}`;
 }
 
 function renderWaterfall(spans) {
@@ -264,10 +280,49 @@ async function simulate(part) {
     $("trace_id").value = tid;
   }
   log(`✅ part=${part} trace=${tid.slice(0, 12)}… 接收 ${data.accepted}，重复 ${data.duplicates}，拒收 ${data.rejected}` +
-      (data.rejected_capacity ? "（并发已满）" : "") + (data.rejected_late ? "（窗口已关闭）" : ""));
+      (data.rejected_capacity ? "（并发已满）" : "") +
+      (data.rejected_cleanup ? "（待清理积压已满）" : "") +
+      (data.rejected_late ? "（窗口已关闭）" : ""));
   await refresh();
   await selectTrace(tid, true);
   return data;
+}
+
+async function simulateBatch() {
+  const total = Math.max(1, Math.min(2000, Number($("batch_count").value) || 1));
+  const CHUNK = 50;
+  let sent = 0, admitted = 0, rejectedSpans = 0;
+  $("send-batch").disabled = true;
+  log(`📦 开始批量上报 ${total} 条 clean 链（每批 ${CHUNK} 条）…`);
+  try {
+    while (sent < total) {
+      const n = Math.min(CHUNK, total - sent);
+      const res = await fetch("/api/simulate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          part: "both",
+          count: n,
+          root_duration_ms: Number($("root_duration_ms").value),
+          downstream_duration_ms: Number($("downstream_duration_ms").value),
+          root_error: false,
+          downstream_error: false,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) { log(`❌ ${data.error}`); return; }
+      admitted += data.admitted_count;
+      rejectedSpans += data.rejected;
+      log(`📦 批 ${sent + 1}–${sent + n}：接纳新链 ${data.admitted_count}/${n}，拒收 span ${data.rejected}` +
+          (data.rejected_cleanup ? "（待清理积压已满）" : "") +
+          (data.rejected_capacity ? "（并发已满）" : ""));
+      sent += n;
+      await refresh();
+    }
+    log(`📦 批量完成：共接纳 ${admitted} 条链，拒收 ${rejectedSpans} 个 span；等待窗口到期后观察「待清理」与接纳恢复`);
+  } finally {
+    $("send-batch").disabled = false;
+  }
 }
 
 $("new-trace").onclick = () => {
@@ -278,6 +333,7 @@ $("new-trace").onclick = () => {
 $("send-both").onclick = () => simulate("both");
 $("send-root").onclick = () => simulate("root");
 $("send-downstream").onclick = () => simulate("downstream");
+$("send-batch").onclick = () => simulateBatch();
 document.querySelectorAll("[data-filter]").forEach((b) => {
   b.onclick = () => { state.filter = b.dataset.filter; refresh(); };
 });

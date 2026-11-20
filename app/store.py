@@ -6,9 +6,24 @@ Semantics implemented here:
   deadline is ``first_seen_at + window_seconds`` and never moves.
 * At the deadline the trace is decided in one transaction: all spans are kept
   if any accepted span in the window had ERROR status, or if a root span took
-  longer than ``slow_root_ms``; otherwise the spans are deleted.
+  longer than ``slow_root_ms``; otherwise the trace is dropped.
 * Leaving the ``collecting`` state is what releases a capacity slot, so the
   decision and the slot release are the same atomic write.
+* Dropping a trace does **not** delete its spans in the decision transaction.
+  The decision only adds the trace's span count to a single-row
+  ``cleanup_state`` ledger; a background loop then deletes the raw spans in
+  small commits (at most ``cleanup_batch_size`` rows each) so ingestion can
+  slip in between batches instead of waiting on one long write lock.
+* The moment a trace is dropped it reads as zero-retention: list and detail
+  views report no retained spans and the detail view stops serving raw span
+  bodies, even while the rows still wait for the cleanup loop.
+* Admission control reads only committed, O(1) state: the collecting-trace
+  count and the ``cleanup_state`` ledger.  When the ledger reaches
+  ``max_pending_delete_spans`` new traces are rejected (collecting traces
+  still report normally) until the backlog drains below the threshold.
+  The ledger is updated in the same transactions that decide traces and
+  purge spans, and is reconciled with the actual rows at startup, so a
+  crash or a failed cleanup batch never desynchronizes it.
 * Spans arriving after the deadline are rejected and can never change a
   decision.  Duplicate ``(trace_id, span_id)`` pairs are stored once.
 * All state lives in SQLite, so a restart keeps the original deadlines.
@@ -70,6 +85,15 @@ CREATE TABLE IF NOT EXISTS spans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans (trace_id);
+
+-- Single-row ledger: spans of dropped traces that still await deletion.
+-- Maintained inside the decision/purge transactions and reconciled with the
+-- actual rows at startup, so admission control is an O(1) read of committed
+-- state no matter how large the backlog grows.
+CREATE TABLE IF NOT EXISTS cleanup_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pending_spans INTEGER NOT NULL DEFAULT 0
+);
 """
 
 _TRACE_COLUMNS = (
@@ -82,6 +106,7 @@ class IngestResult:
     accepted: int = 0
     duplicates: int = 0
     rejected_capacity: int = 0
+    rejected_cleanup: int = 0
     rejected_late: int = 0
     invalid: int = 0
     admitted_traces: list[str] = field(default_factory=list)
@@ -89,12 +114,21 @@ class IngestResult:
 
     @property
     def rejected(self) -> int:
-        return self.rejected_capacity + self.rejected_late + self.invalid
+        return (
+            self.rejected_capacity
+            + self.rejected_cleanup
+            + self.rejected_late
+            + self.invalid
+        )
 
     def rejection_message(self) -> str:
         parts = []
         if self.rejected_capacity:
             parts.append(f"{self.rejected_capacity} span(s) rejected: trace capacity full")
+        if self.rejected_cleanup:
+            parts.append(
+                f"{self.rejected_cleanup} span(s) rejected: cleanup backlog full"
+            )
         if self.rejected_late:
             parts.append(
                 f"{self.rejected_late} span(s) rejected: collection window closed"
@@ -134,6 +168,21 @@ class SqliteStore:
             conn = self._connect()
             try:
                 conn.executescript(SCHEMA)
+                conn.execute(
+                    "INSERT OR IGNORE INTO cleanup_state (id, pending_spans) "
+                    "VALUES (1, 0)"
+                )
+                # Reconcile the ledger with the rows actually present, so a
+                # restart (after a crash or a failed cleanup batch) resumes
+                # cleanup and admission control from what is really stored.
+                conn.execute(
+                    "UPDATE cleanup_state SET pending_spans = ("
+                    "  SELECT COUNT(*) FROM spans s"
+                    "  JOIN traces t ON t.trace_id = s.trace_id"
+                    "  WHERE t.state = ?"
+                    ") WHERE id = 1",
+                    (STATE_DROPPED,),
+                )
             finally:
                 conn.close()
 
@@ -165,12 +214,13 @@ class SqliteStore:
     def _settle_conn(self, conn: sqlite3.Connection, now: float) -> list[str]:
         """Decide every expired trace inside the caller's transaction."""
         rows = conn.execute(
-            "SELECT trace_id, deadline_at, has_error, root_duration_ns "
+            "SELECT trace_id, deadline_at, has_error, root_duration_ns, span_count "
             "FROM traces WHERE state = ? AND deadline_at <= ? "
             "ORDER BY deadline_at, trace_id",
             (STATE_COLLECTING, now),
         ).fetchall()
         decided: list[str] = []
+        pending_add = 0
         for row in rows:
             state, reason = self._decide(row)
             updated = conn.execute(
@@ -181,8 +231,16 @@ class SqliteStore:
             if not updated:
                 continue
             if state == STATE_DROPPED:
-                conn.execute("DELETE FROM spans WHERE trace_id = ?", (row["trace_id"],))
+                # Raw spans are deleted later by the background cleanup loop;
+                # here we only account for them in the ledger.
+                pending_add += row["span_count"]
             decided.append(row["trace_id"])
+        if pending_add:
+            conn.execute(
+                "UPDATE cleanup_state SET pending_spans = pending_spans + ? "
+                "WHERE id = 1",
+                (pending_add,),
+            )
         return decided
 
     def settle_expired(self, now: float) -> list[str]:
@@ -192,6 +250,50 @@ class SqliteStore:
             try:
                 with self._tx(conn):
                     return self._settle_conn(conn, now)
+            finally:
+                conn.close()
+
+    def _pending_delete(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT pending_spans FROM cleanup_state WHERE id = 1"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def purge_dropped_batch(self, batch_size: int | None = None) -> int:
+        """Delete up to ``batch_size`` spans of dropped traces in one commit.
+
+        Each call is a single short transaction so ingestion can proceed
+        between batches.  Returns the number of spans deleted.  The ledger
+        is decremented in the same transaction, so an interrupted purge
+        (failure or crash) leaves committed state consistent and the next
+        batch — or the next process — simply continues from what remains.
+        """
+        size = batch_size if batch_size is not None else self.settings.cleanup_batch_size
+        size = max(1, size)
+        with self._lock:
+            conn = self._connect()
+            try:
+                # Skip the write transaction entirely when nothing is pending.
+                if self._pending_delete(conn) <= 0:
+                    return 0
+                with self._tx(conn):
+                    cursor = conn.execute(
+                        "DELETE FROM spans WHERE rowid IN ("
+                        "  SELECT s.rowid FROM spans s"
+                        "  JOIN traces t ON t.trace_id = s.trace_id"
+                        "  WHERE t.state = ? LIMIT ?"
+                        ")",
+                        (STATE_DROPPED, size),
+                    )
+                    deleted = cursor.rowcount
+                    if deleted:
+                        conn.execute(
+                            "UPDATE cleanup_state "
+                            "SET pending_spans = MAX(pending_spans - ?, 0) "
+                            "WHERE id = 1",
+                            (deleted,),
+                        )
+                return deleted
             finally:
                 conn.close()
 
@@ -209,8 +311,13 @@ class SqliteStore:
                     # the decision visible before admitting new work.
                     result.decided = self._settle_conn(conn, now)
                     active = self._count_collecting(conn)
+                    # O(1) read of committed state: admission cost does not
+                    # grow with the size of the cleanup backlog.
+                    pending = self._pending_delete(conn)
                     for span in spans:
-                        admitted = self._ingest_one(conn, span, now, active, result)
+                        admitted = self._ingest_one(
+                            conn, span, now, active, pending, result
+                        )
                         if admitted:
                             active += 1
             finally:
@@ -228,6 +335,7 @@ class SqliteStore:
         span: ParsedSpan,
         now: float,
         active: int,
+        pending: int,
         result: IngestResult,
     ) -> bool:
         """Store one span.  Returns True when a new trace was admitted."""
@@ -240,6 +348,12 @@ class SqliteStore:
         if trace is None:
             if active >= self.settings.max_active_traces:
                 result.rejected_capacity += 1
+                return False
+            if pending >= self.settings.max_pending_delete_spans:
+                # Dropped-but-not-yet-deleted spans piled up: pause new
+                # traces until the cleanup loop drains the backlog.  Traces
+                # that are already collecting are unaffected (see below).
+                result.rejected_cleanup += 1
                 return False
             conn.execute(
                 "INSERT INTO traces (trace_id, first_seen_at, deadline_at, state) "
@@ -320,13 +434,18 @@ class SqliteStore:
                 ).fetchone()
                 if row is None:
                     return None
-                spans = conn.execute(
-                    "SELECT span_id, parent_span_id, name, service, scope, "
-                    "start_ns, end_ns, duration_ns, is_root, is_error, body, received_at "
-                    "FROM spans WHERE trace_id = ? "
-                    "ORDER BY (start_ns IS NULL), start_ns, span_id",
-                    (trace_id,),
-                ).fetchall()
+                if row["state"] == STATE_DROPPED:
+                    # Dropped traces stop serving raw spans immediately, even
+                    # while rows still await the background cleanup loop.
+                    spans: list[sqlite3.Row] = []
+                else:
+                    spans = conn.execute(
+                        "SELECT span_id, parent_span_id, name, service, scope, "
+                        "start_ns, end_ns, duration_ns, is_root, is_error, body, received_at "
+                        "FROM spans WHERE trace_id = ? "
+                        "ORDER BY (start_ns IS NULL), start_ns, span_id",
+                        (trace_id,),
+                    ).fetchall()
                 payload = _trace_dict(row, spans, now, self.settings)
                 payload["just_decided"] = trace_id in decided
                 return payload
@@ -346,8 +465,9 @@ class SqliteStore:
                     self._settle_conn(conn, now)
                 sql = (
                     "SELECT t.*, "
-                    "(SELECT COUNT(*) FROM spans s WHERE s.trace_id = t.trace_id) "
-                    "AS retained_spans FROM traces t"
+                    "CASE WHEN t.state = 'dropped' THEN 0 "
+                    "ELSE (SELECT COUNT(*) FROM spans s WHERE s.trace_id = t.trace_id) "
+                    "END AS retained_spans FROM traces t"
                 )
                 params: list[Any] = []
                 if state is not None:
@@ -368,6 +488,8 @@ class SqliteStore:
                     ],
                     "counts": {name: counts.get(name, 0) for name in ALL_STATES},
                     "capacity": self.settings.max_active_traces,
+                    "pending_delete_spans": self._pending_delete(conn),
+                    "max_pending_delete_spans": self.settings.max_pending_delete_spans,
                     "now": now,
                 }
             finally:

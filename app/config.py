@@ -38,6 +38,9 @@ class Settings:
     max_active_traces: int = 8
     slow_root_ms: float = 500.0
     sweep_interval_seconds: float = 0.05
+    cleanup_batch_size: int = 200
+    cleanup_interval_seconds: float = 0.1
+    max_pending_delete_spans: int = 1000
     clock: Callable[[], float] = field(default=time.time, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -49,6 +52,12 @@ class Settings:
             raise ValueError("slow_root_ms must be > 0")
         if self.sweep_interval_seconds <= 0:
             raise ValueError("sweep_interval_seconds must be > 0")
+        if self.cleanup_batch_size < 1:
+            raise ValueError("cleanup_batch_size must be >= 1")
+        if self.cleanup_interval_seconds <= 0:
+            raise ValueError("cleanup_interval_seconds must be > 0")
+        if self.max_pending_delete_spans < 1:
+            raise ValueError("max_pending_delete_spans must be >= 1")
 
     @property
     def slow_root_ns(self) -> int:
@@ -62,4 +71,7 @@ class Settings:
             max_active_traces=_env_int("MAX_ACTIVE_TRACES", 8),
             slow_root_ms=_env_float("SLOW_ROOT_MS", 500.0),
             sweep_interval_seconds=_env_int("SWEEP_INTERVAL_MS", 50) / 1000.0,
+            cleanup_batch_size=_env_int("CLEANUP_BATCH_SIZE", 200),
+            cleanup_interval_seconds=_env_int("CLEANUP_INTERVAL_MS", 100) / 1000.0,
+            max_pending_delete_spans=_env_int("MAX_PENDING_DELETE_SPANS", 1000),
         )

@@ -79,20 +79,27 @@ def build_otlp_payload(body: dict[str, Any]) -> dict[str, Any]:
         {
           "trace_id": "32 hex chars", "span_id": "16 hex chars",
           "part": "both" | "root" | "downstream",
+          "count": 1,
           "root_duration_ms": 80,
           "root_error": false,
           "downstream_duration_ms": 40,
           "downstream_error": false
         }
+
+    ``count`` generates that many independent traces in one payload (used by
+    the UI's batch button to build a cleanup backlog); explicit
+    ``trace_id``/``span_id`` only apply when ``count`` is 1.
     """
     part = str(body.get("part", "both")).lower()
     if part not in {"both", "root", "downstream"}:
         raise ValueError("part must be one of: both, root, downstream")
 
-    trace_id = _hex16(body.get("trace_id"), 32, "trace_id") or _random_hex(32)
-    span_id = _hex16(body.get("span_id"), 16, "span_id") or _random_hex(16)
-    client_span_id = _random_hex(16)
-    server_span_id = _random_hex(16)
+    count = _positive_int(body.get("count", 1), "count", maximum=2000)
+    if count > 1 and (body.get("trace_id") or body.get("span_id")):
+        raise ValueError("trace_id/span_id only apply to a single trace (count=1)")
+
+    trace_id = _hex16(body.get("trace_id"), 32, "trace_id")
+    span_id = _hex16(body.get("span_id"), 16, "span_id")
 
     root_duration = _positive_float(body.get("root_duration_ms", 80.0), "root_duration_ms")
     downstream_duration = _positive_float(
@@ -101,59 +108,65 @@ def build_otlp_payload(body: dict[str, Any]) -> dict[str, Any]:
     root_error = bool(body.get("root_error", False))
     downstream_error = bool(body.get("downstream_error", False))
 
-    root_start = _now_ns() - int(root_duration * 1_000_000)
-    # The downstream hop starts a little after the entry span and must fit
-    # inside the root span for realistic waterfall diagrams.
-    downstream_start = root_start + int(min(root_duration * 0.15, 50.0) * 1_000_000)
-
     entry_spans: list[dict[str, Any]] = []
     downstream_spans: list[dict[str, Any]] = []
     client_spans: list[dict[str, Any]] = []
 
-    if part in {"both", "root"}:
-        entry_spans.append(
-            _span(
-                trace_id=trace_id,
-                span_id=span_id,
-                parent_span_id=None,
-                name="POST /checkout",
-                kind=2,
-                start_ns=root_start,
-                duration_ms=root_duration,
-                is_error=root_error,
-                error_message="checkout failed",
-                attributes={"http.method": "POST", "demo.part": "entry"},
+    for _ in range(count):
+        chain_trace_id = trace_id or _random_hex(32)
+        chain_span_id = span_id or _random_hex(16)
+        client_span_id = _random_hex(16)
+        server_span_id = _random_hex(16)
+
+        root_start = _now_ns() - int(root_duration * 1_000_000)
+        # The downstream hop starts a little after the entry span and must fit
+        # inside the root span for realistic waterfall diagrams.
+        downstream_start = root_start + int(min(root_duration * 0.15, 50.0) * 1_000_000)
+
+        if part in {"both", "root"}:
+            entry_spans.append(
+                _span(
+                    trace_id=chain_trace_id,
+                    span_id=chain_span_id,
+                    parent_span_id=None,
+                    name="POST /checkout",
+                    kind=2,
+                    start_ns=root_start,
+                    duration_ms=root_duration,
+                    is_error=root_error,
+                    error_message="checkout failed",
+                    attributes={"http.method": "POST", "demo.part": "entry"},
+                )
             )
-        )
-    if part in {"both", "downstream"}:
-        client_spans.append(
-            _span(
-                trace_id=trace_id,
-                span_id=client_span_id,
-                parent_span_id=span_id,
-                name="inventory.reserve",
-                kind=3,
-                start_ns=downstream_start,
-                duration_ms=downstream_duration,
-                is_error=downstream_error,
-                error_message="reserve failed",
-                attributes={"demo.part": "downstream"},
+        if part in {"both", "downstream"}:
+            client_spans.append(
+                _span(
+                    trace_id=chain_trace_id,
+                    span_id=client_span_id,
+                    parent_span_id=chain_span_id,
+                    name="inventory.reserve",
+                    kind=3,
+                    start_ns=downstream_start,
+                    duration_ms=downstream_duration,
+                    is_error=downstream_error,
+                    error_message="reserve failed",
+                    attributes={"demo.part": "downstream"},
+                )
             )
-        )
-        downstream_spans.append(
-            _span(
-                trace_id=trace_id,
-                span_id=server_span_id,
-                parent_span_id=client_span_id,
-                name="POST /inventory/reserve",
-                kind=2,
-                start_ns=downstream_start + 1_000_000,
-                duration_ms=max(downstream_duration - 1.0, 0.1),
-                is_error=downstream_error,
-                error_message="reserve failed",
-                attributes={"demo.part": "downstream"},
+            downstream_spans.append(
+                _span(
+                    trace_id=chain_trace_id,
+                    span_id=server_span_id,
+                    parent_span_id=client_span_id,
+                    name="POST /inventory/reserve",
+                    kind=2,
+                    start_ns=downstream_start + 1_000_000,
+                    duration_ms=max(downstream_duration - 1.0, 0.1),
+                    is_error=downstream_error,
+                    error_message="reserve failed",
+                    attributes={"demo.part": "downstream"},
+                )
             )
-        )
 
     resource_spans = []
     if entry_spans or client_spans:
@@ -189,4 +202,16 @@ def _positive_float(value: Any, field: str) -> float:
         raise ValueError(f"{field} must be a number") from exc
     if number <= 0:
         raise ValueError(f"{field} must be > 0")
+    return number
+
+
+def _positive_int(value: Any, field: str, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if number < 1 or number > maximum:
+        raise ValueError(f"{field} must be between 1 and {maximum}")
     return number

@@ -7,7 +7,9 @@ instantly; every test goes through the real FastAPI routes and SQLite file.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -43,6 +45,9 @@ def make_settings(tmp_path, clock, **overrides) -> Settings:
         max_active_traces=8,
         slow_root_ms=500.0,
         sweep_interval_seconds=0.05,
+        # Tests drive cleanup explicitly via store.purge_dropped_batch();
+        # the background loop only runs where a test opts into it.
+        cleanup_interval_seconds=3600.0,
         clock=clock,
     )
     values.update(overrides)
@@ -122,6 +127,22 @@ def trace(client: TestClient, trace_id: str) -> dict:
     return response.json()
 
 
+def store_of(client: TestClient) -> SqliteStore:
+    return client.app.state.store
+
+
+def pending_delete(client: TestClient) -> int:
+    return client.get("/api/stats").json()["pending_delete_spans"]
+
+
+def count_span_rows(db_path: str) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # sampling outcomes
 # --------------------------------------------------------------------------
@@ -162,8 +183,15 @@ def test_clean_trace_is_dropped_and_spans_purged(client, clock):
     data = trace(client, tid(4))
     assert data["state"] == "dropped"
     assert data["decision_reason"] == "clean"
+    # The decision is effective immediately: zero retention and no raw spans,
+    # even though the rows still await the background cleanup loop.
     assert data["spans"] == []
     assert data["retained_spans"] == 0
+    # The decision did not delete rows itself; it accounted for them.
+    assert pending_delete(client) == 2
+    # The background purge removes the actual rows and drains the ledger.
+    assert store_of(client).purge_dropped_batch() == 2
+    assert pending_delete(client) == 0
 
 
 def test_error_outside_window_is_too_late(client, clock):
@@ -382,3 +410,180 @@ def test_sqlite_store_direct_expiry(tmp_path, clock):
     clock.advance(5.0)
     assert store.settle_expired(clock()) == [tid(800)]
     assert store.settle_expired(clock()) == []  # idempotent
+
+
+# --------------------------------------------------------------------------
+# background cleanup of dropped spans
+# --------------------------------------------------------------------------
+
+
+def test_purge_deletes_at_most_batch_size_per_commit(client, clock, tmp_path):
+    # Three clean traces of 150 spans each -> a 450-span backlog at decision.
+    for n in range(3):
+        spans = [span(tid(50 + n), sid(1000 + i)) for i in range(150)]
+        post(client, otlp(*spans))
+    clock.advance(5.0)
+    assert pending_delete(client) == 450
+    db_path = str(tmp_path / "collector.db")
+    assert count_span_rows(db_path) == 450
+
+    store = store_of(client)
+    assert store.purge_dropped_batch() == 200  # default batch cap
+    assert pending_delete(client) == 250
+    assert count_span_rows(db_path) == 250
+    assert store.purge_dropped_batch() == 200
+    assert pending_delete(client) == 50
+    assert store.purge_dropped_batch() == 50  # short final batch
+    assert pending_delete(client) == 0
+    assert count_span_rows(db_path) == 0
+    assert store.purge_dropped_batch() == 0  # nothing left to do
+
+
+def test_dropped_trace_stops_serving_spans_but_rejects_late_ones(client, clock, tmp_path):
+    post(client, otlp(span(tid(60), sid(1)), span(tid(60), sid(2), parent=sid(1))))
+    clock.advance(5.0)
+    data = trace(client, tid(60))
+    assert data["state"] == "dropped"
+    assert data["spans"] == [] and data["retained_spans"] == 0
+    # Rows are still on disk (cleanup has not run yet) ...
+    assert count_span_rows(str(tmp_path / "collector.db")) == 2
+    # ... but the API no longer serves them, and late spans stay rejected.
+    body = post(client, otlp(span(tid(60), sid(3), error=True)))
+    assert body["partialSuccess"]["rejectedSpans"] == 1
+    assert "window closed" in body["partialSuccess"]["errorMessage"]
+    assert trace(client, tid(60))["spans"] == []
+
+
+def test_backlog_threshold_rejects_new_traces_until_drained(tmp_path, clock):
+    settings = make_settings(tmp_path, clock, max_pending_delete_spans=10)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        # A 12-span clean trace decided at t=5 builds a backlog of 12 (>= 10).
+        post(client, otlp(*[span(tid(2), sid(100 + i)) for i in range(12)]))
+        clock.advance(3)
+        # This trace starts collecting at t=3, so it survives the t=5 sweep.
+        post(client, otlp(span(tid(1), sid(1))))
+        clock.advance(2)
+
+        listing = client.get("/api/traces").json()
+        assert listing["pending_delete_spans"] == 12
+        assert listing["max_pending_delete_spans"] == 10
+        assert listing["counts"]["collecting"] == 1
+
+        # New traces are refused while the backlog is at/over the threshold.
+        body = post(client, otlp(span(tid(3), sid(1))))
+        assert body["partialSuccess"]["rejectedSpans"] == 1
+        assert "cleanup backlog" in body["partialSuccess"]["errorMessage"]
+        assert client.get(f"/api/traces/{tid(3)}").status_code == 404
+
+        # Collecting traces keep reporting normally during the backlog.
+        ok = post(client, otlp(span(tid(1), sid(2), parent=sid(1))))
+        assert "partialSuccess" not in ok
+        assert trace(client, tid(1))["retained_spans"] == 2
+
+        # Drain part of the backlog: below the threshold, admission resumes
+        # under the normal capacity rules.
+        store = store_of(client)
+        assert store.purge_dropped_batch(5) == 5
+        assert pending_delete(client) == 7
+        ok2 = post(client, otlp(span(tid(3), sid(1))))
+        assert "partialSuccess" not in ok2
+        assert trace(client, tid(3))["state"] == "collecting"
+
+
+def test_restart_reconciles_pending_and_resumes_cleanup(tmp_path, clock):
+    settings = make_settings(tmp_path, clock, max_pending_delete_spans=10)
+    app1 = create_app(settings)
+    with TestClient(app1) as c1:
+        post(c1, otlp(*[span(tid(2), sid(100 + i)) for i in range(12)]))
+        clock.advance(5.0)
+        assert pending_delete(c1) == 12
+        # Purge one batch, then "crash" with 7 spans still on disk.
+        assert store_of(c1).purge_dropped_batch(5) == 5
+
+    # Restart on the same DB: the ledger resumes from what is actually stored.
+    app2 = create_app(make_settings(tmp_path, clock, max_pending_delete_spans=10))
+    with TestClient(app2) as c2:
+        assert pending_delete(c2) == 7
+        # Admission control follows the real remainder: 7 < 10, so accept.
+        assert "partialSuccess" not in post(c2, otlp(span(tid(3), sid(1))))
+        # Cleanup continues from the actual remainder, not from scratch.
+        assert store_of(c2).purge_dropped_batch(200) == 7
+        assert pending_delete(c2) == 0
+        assert count_span_rows(str(tmp_path / "collector.db")) == 1  # tid(3)'s span
+
+
+def test_restart_reconciles_a_corrupted_ledger(tmp_path, clock):
+    settings = make_settings(tmp_path, clock, max_pending_delete_spans=10)
+    app1 = create_app(settings)
+    with TestClient(app1) as c1:
+        post(c1, otlp(*[span(tid(2), sid(100 + i)) for i in range(12)]))
+        clock.advance(5.0)
+        assert pending_delete(c1) == 12
+
+    # Simulate a lost update: the ledger claims 0 while 12 rows remain.
+    conn = sqlite3.connect(str(tmp_path / "collector.db"))
+    try:
+        conn.execute("UPDATE cleanup_state SET pending_spans = 0 WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    app2 = create_app(make_settings(tmp_path, clock, max_pending_delete_spans=10))
+    with TestClient(app2) as c2:
+        # Startup reconciliation restores the committed reality: 12 >= 10.
+        assert pending_delete(c2) == 12
+        body = post(c2, otlp(span(tid(3), sid(1))))
+        assert "cleanup backlog" in body["partialSuccess"]["errorMessage"]
+
+
+def test_background_cleanup_loop_drains_backlog(tmp_path, clock):
+    settings = make_settings(
+        tmp_path, clock, cleanup_interval_seconds=0.05, cleanup_batch_size=5
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        post(client, otlp(*[span(tid(2), sid(100 + i)) for i in range(12)]))
+        clock.advance(5.0)
+        assert pending_delete(client) == 12
+        # The loop purges 5 rows per tick; 12 rows need three ticks.
+        deadline = time.time() + 5
+        while time.time() < deadline and pending_delete(client) > 0:
+            time.sleep(0.05)
+        assert pending_delete(client) == 0
+        assert count_span_rows(str(tmp_path / "collector.db")) == 0
+
+
+# --------------------------------------------------------------------------
+# batch simulation (web UI backlog builder)
+# --------------------------------------------------------------------------
+
+
+def test_simulate_batch_count(client, clock):
+    body = client.post("/api/simulate", json={"part": "both", "count": 5}).json()
+    assert body["submitted_spans"] == 15  # 5 traces x (root + client + server)
+    assert body["accepted"] == 15
+    assert body["trace_count"] == 5
+    assert body["admitted_count"] == 5
+    assert client.get("/api/stats").json()["counts"]["collecting"] == 5
+
+
+def test_simulate_reports_cleanup_rejections(tmp_path, clock):
+    settings = make_settings(tmp_path, clock, max_pending_delete_spans=5)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        client.post("/api/simulate", json={"count": 3})  # 3 clean traces, 9 spans
+        clock.advance(5.0)
+        assert pending_delete(client) == 9
+        body = client.post("/api/simulate", json={"count": 2}).json()
+        assert body["accepted"] == 0
+        assert body["rejected_cleanup"] == 6  # 2 traces x 3 spans
+        assert "cleanup backlog" in body["rejection_message"]
+
+
+def test_simulate_rejects_trace_id_with_count(client):
+    response = client.post(
+        "/api/simulate", json={"count": 2, "trace_id": tid(1)}
+    )
+    assert response.status_code == 400
+    assert "count" in response.json()["error"]

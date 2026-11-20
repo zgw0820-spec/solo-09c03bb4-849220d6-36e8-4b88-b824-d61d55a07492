@@ -67,15 +67,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:  # pragma: no cover - defensive background logging
                 logger.exception("background sweep failed")
 
+    async def cleanup_loop() -> None:
+        """Delete dropped traces' raw spans in small commits.
+
+        Each batch is its own short transaction (at most
+        ``cleanup_batch_size`` rows), so ingestion keeps flowing between
+        batches instead of piling up behind one long write lock.  A failed
+        batch is logged and retried on the next tick; the ledger in SQLite
+        always reflects committed deletions.
+        """
+        interval = settings.cleanup_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.to_thread(store.purge_dropped_batch)
+            except Exception:  # pragma: no cover - defensive background logging
+                logger.exception("background cleanup failed")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        task = asyncio.create_task(sweep_loop())
+        tasks = [
+            asyncio.create_task(sweep_loop()),
+            asyncio.create_task(cleanup_loop()),
+        ]
         try:
             yield
         finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(
         title="OTLP Tail Sampling Collector",
@@ -102,6 +124,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_active_traces": settings.max_active_traces,
             "slow_root_ms": settings.slow_root_ms,
             "sweep_interval_seconds": settings.sweep_interval_seconds,
+            "cleanup_batch_size": settings.cleanup_batch_size,
+            "cleanup_interval_seconds": settings.cleanup_interval_seconds,
+            "max_pending_delete_spans": settings.max_pending_delete_spans,
         }
 
     # -- OTLP/HTTP ingestion ------------------------------------------------
@@ -140,6 +165,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "counts": data["counts"],
             "capacity": data["capacity"],
+            "pending_delete_spans": data["pending_delete_spans"],
+            "max_pending_delete_spans": data["max_pending_delete_spans"],
             "now": data["now"],
         }
 
@@ -152,7 +179,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ``part`` selects which batch is sent: ``"both"`` (default) reports the
         entry/server span and the downstream client+server spans in one
         request, ``"root"`` or ``"downstream"`` send them as separate batches
-        to emulate staggered downstream reporting.
+        to emulate staggered downstream reporting.  ``count`` emits that many
+        independent traces in one payload (the UI's batch button uses it to
+        build a cleanup backlog).
         """
         from .simulator import build_otlp_payload
 
@@ -165,6 +194,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = await asyncio.to_thread(
             store.ingest, parsed.spans, settings.clock(), parsed.invalid
         )
+        trace_ids = sorted({span.trace_id for span in parsed.spans})
         return {
             "part": part,
             "submitted_spans": len(parsed.spans),
@@ -172,12 +202,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "duplicates": result.duplicates,
             "rejected": result.rejected,
             "rejected_capacity": result.rejected_capacity,
+            "rejected_cleanup": result.rejected_cleanup,
             "rejected_late": result.rejected_late,
-            "trace_ids": sorted({span.trace_id for span in parsed.spans}),
+            "rejection_message": result.rejection_message() or None,
+            "trace_ids": trace_ids[:10],
+            "trace_count": len(trace_ids),
             "root_span_id": next(
                 (span.span_id for span in parsed.spans if span.is_root), None
             ),
-            "admitted_traces": result.admitted_traces,
+            "admitted_traces": result.admitted_traces[:10],
+            "admitted_count": len(result.admitted_traces),
         }
 
     if STATIC_DIR.is_dir():
