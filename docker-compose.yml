@@ -1,0 +1,20 @@
+services:
+  collector:
+    build: .
+    image: otlp-tail-sampler:local
+    container_name: otlp-tail-sampler
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/collector.db
+      COLLECT_WINDOW_SECONDS: "5"
+      MAX_ACTIVE_TRACES: "8"
+      SLOW_ROOT_MS: "500"
+      SWEEP_INTERVAL_MS: "50"
+    volumes:
+      # Named volume keeps collection state (and deadlines) across restarts.
+      - collector-data:/data
+    restart: unless-stopped
+
+volumes:
+  collector-data:

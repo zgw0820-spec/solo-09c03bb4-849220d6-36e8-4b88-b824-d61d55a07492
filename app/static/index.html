@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>OTLP 尾采样收集器</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #10151c; color: #d7dee8;
+  }
+  header { padding: 18px 24px; border-bottom: 1px solid #232c38; display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; color: #9fd0ff; }
+  .muted { color: #7d8b9c; }
+  main { display: grid; grid-template-columns: 390px 1fr; gap: 18px; padding: 18px 24px; align-items: start; }
+  section { background: #151b24; border: 1px solid #232c38; border-radius: 8px; padding: 14px; }
+  section h2 { margin: 0 0 10px; font-size: 14px; color: #9fd0ff; }
+  label { display: block; margin: 8px 0 2px; color: #97a4b5; font-size: 12px; }
+  input[type=number], input[type=text] { width: 100%; padding: 5px 7px; background: #0d1218; color: #d7dee8; border: 1px solid #2b3644; border-radius: 5px; }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  button { padding: 7px 12px; background: #1d4ed8; color: #fff; border: 0; border-radius: 5px; cursor: pointer; }
+  button.secondary { background: #2a3646; }
+  button:disabled { opacity: .5; cursor: default; }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .checks { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
+  .checks label { display: flex; gap: 5px; align-items: center; margin: 0; }
+  .caps { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; }
+  .caps b { color: #ffd479; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 7px; border-bottom: 1px solid #202834; }
+  th { color: #8d9bad; font-weight: 500; }
+  tr.trace-row { cursor: pointer; }
+  tr.trace-row:hover { background: #1a2330; }
+  tr.selected { background: #1c2b40; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; }
+  .badge.collecting { background: #3b2f10; color: #ffd479; }
+  .badge.kept { background: #10331f; color: #6fe095; }
+  .badge.dropped { background: #331318; color: #ff8f9b; }
+  .badge.err { background: #3a1117; color: #ff9aa5; }
+  .badge.slow { background: #2b1a3d; color: #c9a2ff; }
+  .badge.ok { background: #1b2836; color: #8fb6d9; }
+  .mono { font-family: inherit; word-break: break-all; }
+  #log { max-height: 190px; overflow: auto; font-size: 12px; background: #0b0f14; border-radius: 5px; padding: 8px; margin-top: 12px; white-space: pre-wrap; }
+  .waterfall { margin-top: 10px; }
+  .wf-row { display: grid; grid-template-columns: 260px 1fr 90px; gap: 8px; align-items: center; padding: 3px 0; font-size: 12px; }
+  .wf-track { background: #0b0f14; border-radius: 3px; height: 14px; position: relative; }
+  .wf-bar { position: absolute; top: 0; height: 14px; border-radius: 3px; background: #2f6fd0; min-width: 2px; }
+  .wf-bar.error { background: #b5323f; }
+  .span-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  pre { background: #0b0f14; padding: 8px; border-radius: 5px; overflow: auto; max-height: 240px; font-size: 11.5px; }
+  details summary { cursor: pointer; color: #8fb6d9; margin-top: 6px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 3px 10px; font-size: 12.5px; }
+  .kv span:nth-child(odd) { color: #8d9bad; }
+  .empty { color: #66768a; padding: 8px 0; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>OTLP 尾采样收集器</h1>
+  <span class="muted" id="cfg">loading config…</span>
+  <span class="caps" id="caps"></span>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>模拟上报</h2>
+      <label>trace_id（留空自动生成）</label>
+      <input type="text" id="trace_id" placeholder="32 位十六进制">
+      <div class="row">
+        <div><label>入口耗时 ms</label><input type="number" id="root_duration_ms" value="80" min="1"></div>
+        <div><label>下游耗时 ms</label><input type="number" id="downstream_duration_ms" value="40" min="1"></div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="root_error"> 入口报错</label>
+        <label><input type="checkbox" id="downstream_error"> 下游报错</label>
+      </div>
+      <div class="buttons">
+        <button id="send-both">一次上报整条链</button>
+        <button class="secondary" id="new-trace">新链路</button>
+      </div>
+      <div class="buttons">
+        <button class="secondary" id="send-root">① 先报入口</button>
+        <button class="secondary" id="send-downstream">② 稍后补报下游</button>
+      </div>
+      <div id="log"></div>
+    </section>
+
+    <section style="margin-top:18px">
+      <h2>链路列表</h2>
+      <div class="buttons" style="margin:0 0 8px">
+        <button class="secondary" data-filter="">全部</button>
+        <button class="secondary" data-filter="collecting">收集中</button>
+        <button class="secondary" data-filter="kept">已留存</button>
+        <button class="secondary" data-filter="dropped">已丢弃</button>
+      </div>
+      <table>
+        <thead><tr><th>trace ID</th><th>状态</th><th>span</th></tr></thead>
+        <tbody id="trace-rows"></tbody>
+      </table>
+      <div class="empty" id="no-traces" hidden>暂无链路</div>
+    </section>
+  </div>
+
+  <section>
+    <h2>链路详情 <span class="muted" id="detail-id"></span></h2>
+    <div id="detail" class="empty">在左侧选择一条链路，或在地址栏加 ?trace=&lt;trace_id&gt; 直接查看。</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { filter: "", selected: null, config: null, staged: null };
+
+function fmtMs(ns) {
+  return ns === null || ns === undefined ? "—" : (ns / 1e6).toFixed(2) + " ms";
+}
+function fmtTime(ts) {
+  return ts ? new Date(ts * 1000).toLocaleTimeString() : "—";
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function log(msg) {
+  const el = $("log");
+  el.textContent = new Date().toLocaleTimeString() + "  " + msg + "\n" + el.textContent;
+}
+
+async function loadConfig() {
+  const cfg = await (await fetch("/api/config")).json();
+  state.config = cfg;
+  $("cfg").textContent =
+    `窗口 ${cfg.window_seconds}s · 并发上限 ${cfg.max_active_traces} 条 · 慢根阈值 ${cfg.slow_root_ms}ms`;
+}
+
+async function refresh() {
+  const params = new URLSearchParams({ limit: "100" });
+  if (state.filter) params.set("state", state.filter);
+  const data = await (await fetch("/api/traces?" + params)).json();
+  $("caps").innerHTML =
+    `收集中的链 <b>${data.counts.collecting}/${data.capacity}</b> · 留存 <b>${data.counts.kept}</b> · 丢弃 <b>${data.counts.dropped}</b>`;
+  const tbody = $("trace-rows");
+  tbody.innerHTML = "";
+  for (const t of data.traces) {
+    const tr = document.createElement("tr");
+    tr.className = "trace-row" + (t.trace_id === state.selected ? " selected" : "");
+    const reason = t.state === "collecting"
+      ? `剩 ${t.remaining_seconds.toFixed(1)}s`
+      : (t.decision_reason || "");
+    tr.innerHTML =
+      `<td class="mono">${esc(t.trace_id.slice(0, 12))}…<br><span class="muted">${esc(reason)}</span></td>` +
+      `<td><span class="badge ${t.state}">${t.state}</span></td>` +
+      `<td>${t.state === "dropped" ? "0" : t.retained_spans ?? t.span_count}</td>`;
+    tr.onclick = () => selectTrace(t.trace_id);
+    tbody.appendChild(tr);
+  }
+  $("no-traces").hidden = data.traces.length > 0;
+  if (!state.selected && data.traces.length) selectTrace(data.traces[0].trace_id, true);
+}
+
+async function selectTrace(traceId, quiet) {
+  state.selected = traceId;
+  const url = new URL(location);
+  url.searchParams.set("trace", traceId);
+  history.replaceState(null, "", url);
+  const res = await fetch("/api/traces/" + encodeURIComponent(traceId));
+  if (!res.ok) {
+    $("detail").innerHTML = `<div class="empty">找不到链路 ${esc(traceId)}</div>`;
+    return;
+  }
+  renderDetail(await res.json());
+  if (!quiet) refreshRowsSelection();
+}
+
+function refreshRowsSelection() {
+  document.querySelectorAll("tr.trace-row").forEach((tr) => {
+    tr.classList.toggle("selected", tr.textContent.includes(state.selected.slice(0, 12)));
+  });
+}
+
+function renderDetail(t) {
+  $("detail-id").textContent = t.trace_id;
+  const badge = `<span class="badge ${t.state}">${t.state}</span>`;
+  const reasons = [];
+  if (t.has_error) reasons.push('<span class="badge err">窗口内有报错 span</span>');
+  if (t.root_duration_ns !== null && t.root_duration_ns > t.slow_root_ms * 1e6)
+    reasons.push('<span class="badge slow">根 span 超时</span>');
+  if (t.state !== "collecting" && !reasons.length) reasons.push('<span class="badge ok">无异常</span>');
+
+  const spans = t.spans || [];
+  const wf = spans.length ? renderWaterfall(spans) : '<div class="empty">窗口内没有留存的 span</div>';
+
+  $("detail").className = "";
+  $("detail").innerHTML = `
+    <div class="kv">
+      <span>状态</span><span>${badge} ${reasons.join(" ")}</span>
+      <span>判定原因</span><span>${esc(t.decision_reason || (t.state === "collecting" ? "等待窗口结束" : "—"))}</span>
+      <span>首次接纳</span><span>${fmtTime(t.first_seen_at)}</span>
+      <span>截止时间</span><span>${fmtTime(t.deadline_at)}${t.state === "collecting" ? "（剩 " + t.remaining_seconds.toFixed(1) + "s）" : ""}</span>
+      <span>根 span 耗时</span><span>${fmtMs(t.root_duration_ns)}（阈值 ${t.slow_root_ms}ms）</span>
+      <span>留存 span</span><span>${t.retained_spans} / 已接收 ${t.span_count}</span>
+      <span>入口服务</span><span>${esc(t.service || "—")}</span>
+    </div>
+    <div class="waterfall">${wf}</div>
+    <details><summary>原始 span JSON（${spans.length}）</summary>
+      <pre>${esc(JSON.stringify(spans.map((s) => ({ span_id: s.span_id, parent_span_id: s.parent_span_id, name: s.name, service: s.service, status: s.is_error ? "ERROR" : "OK", duration_ms: s.duration_ms, body: JSON.parse(s.body) })), null, 2))}</pre>
+    </details>`;
+}
+
+function renderWaterfall(spans) {
+  const starts = spans.map((s) => s.start_ns).filter((v) => v !== null);
+  const ends = spans.map((s) => s.end_ns).filter((v) => v !== null);
+  if (!starts.length || !ends.length) return '<div class="empty">span 缺少时间戳，无法绘制瀑布图</div>';
+  const t0 = Math.min(...starts), t1 = Math.max(...ends);
+  const total = Math.max(t1 - t0, 1);
+  const rows = [...spans]
+    .sort((a, b) => (a.start_ns ?? 0) - (b.start_ns ?? 0))
+    .map((s) => {
+      const left = s.start_ns === null ? 0 : ((s.start_ns - t0) / total) * 100;
+      const width = s.duration_ns === null ? 0.5 : Math.max((s.duration_ns / total) * 100, 0.5);
+      const depth = s.parent_span_id ? "↳ " : "";
+      return `<div class="wf-row">
+        <div class="span-name" title="${esc(s.name)}">${depth}${esc(s.name)} <span class="muted">${esc(s.service || "")}</span></div>
+        <div class="wf-track"><div class="wf-bar ${s.is_error ? "error" : ""}" style="left:${left}%;width:${width}%"></div></div>
+        <div class="muted">${fmtMs(s.duration_ns)}</div>
+      </div>`;
+    }).join("");
+  return rows;
+}
+
+async function simulate(part) {
+  const typed = $("trace_id").value.trim() || null;
+  if (part === "downstream" && !state.staged) {
+    log("⚠️ 还没有入口批次：先点「① 先报入口」，再补报下游");
+    return null;
+  }
+  const sameTrace = part === "downstream" ? state.staged.traceId : typed;
+  const body = {
+    part,
+    // Reuse the entry span id only when continuing a staged trace; every new
+    // entry batch gets a fresh root span id from the server.
+    trace_id: sameTrace,
+    span_id: part === "downstream" ? state.staged.rootSpanId : null,
+    root_duration_ms: Number($("root_duration_ms").value),
+    downstream_duration_ms: Number($("downstream_duration_ms").value),
+    root_error: $("root_error").checked,
+    downstream_error: $("downstream_error").checked,
+  };
+  const res = await fetch("/api/simulate", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) { log(`❌ ${data.error}`); return null; }
+  const tid = data.trace_ids[0];
+  if (part === "downstream") {
+    state.staged.downstreamSent = true;
+  } else {
+    // Keep the same trace for the staged follow-up.
+    state.staged = { traceId: tid, rootSpanId: data.root_span_id, downstreamSent: false };
+    $("trace_id").value = tid;
+  }
+  log(`✅ part=${part} trace=${tid.slice(0, 12)}… 接收 ${data.accepted}，重复 ${data.duplicates}，拒收 ${data.rejected}` +
+      (data.rejected_capacity ? "（并发已满）" : "") + (data.rejected_late ? "（窗口已关闭）" : ""));
+  await refresh();
+  await selectTrace(tid, true);
+  return data;
+}
+
+$("new-trace").onclick = () => {
+  state.staged = null;
+  $("trace_id").value = "";
+  log("🆕 已清空，下一次上报将创建新链路");
+};
+$("send-both").onclick = () => simulate("both");
+$("send-root").onclick = () => simulate("root");
+$("send-downstream").onclick = () => simulate("downstream");
+document.querySelectorAll("[data-filter]").forEach((b) => {
+  b.onclick = () => { state.filter = b.dataset.filter; refresh(); };
+});
+
+(async function init() {
+  await loadConfig();
+  const preset = new URL(location).searchParams.get("trace");
+  if (preset) state.selected = preset;
+  await refresh();
+  if (state.selected) await selectTrace(state.selected, true);
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>
